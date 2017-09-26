@@ -2,16 +2,60 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
+	"net/http"
+	"os"
 	"strconv"
-	//"log"
 	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
+
+// logger for verbose mode
+var vlog *log.Logger
+
+// TODO: For each run, fetch each URL only once (cache response)
+// TODO: Also save headers
+// TODO: Expires field is ignored, update it
+
+func httpEtagGet(hc *http.Client, url, etagReq string) (body []byte, etag string, err error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("cannot create HTTP request: %v", err)
+	}
+	if etagReq != "" {
+		req.Header.Add("If-None-Match", etagReq)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("cannot GET from HTTP: %s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusNotModified {
+			err = errUnchanged
+		} else {
+			err = fmt.Errorf("server returned status: %s", resp.Status)
+		}
+		io.Copy(ioutil.Discard, resp.Body)
+		return nil, "", err
+	}
+	body, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("cannot read from HTTP: %s", err)
+	}
+	etag = strings.Trim(resp.Header.Get("Etag"), "\"")
+	return body, etag, nil
+}
+
+var errUnchanged = errors.New("unchanged")
 
 type entry struct {
 	url, etag string
@@ -34,23 +78,48 @@ func newEntry(url, etag, date string) (*entry, error) {
 	return e, nil
 }
 
-type dbconn struct {
-	db          *sql.DB
-	readQuery   string
-	updateQuery string
-	afterQuery  string
+func (e *entry) refresh(hc *http.Client) {
+	body, etag, err := httpEtagGet(hc, e.url, e.etag)
+	if err != nil {
+		e.err = err
+		return
+	}
+	e.err = nil
+	e.content = body
+	e.etag = etag
+	e.date = time.Now()
 }
 
-func newDbconn(cf *dbconf) (*dbconn, error) {
+type dbconn struct {
+	db           *sql.DB
+	name         string
+	readQuery    string
+	updateQuery  string
+	afterQueries []string
+}
+
+func newDbconn(name string, cf *DBConf) (*dbconn, error) {
 	var err error
-	c := &dbconn{}
-	c.db, err = sql.Open("mysql", cf.dsn)
+	c := &dbconn{name: name}
+	c.db, err = sql.Open("mysql", cf.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open SQL database: %v", err)
 	}
-	c.readQuery = fmt.Sprintf("SELECT %s,%s,%s FROM %s", cf.urlf, cf.etagf, cf.datef, cf.table)
-	c.updateQuery = fmt.Sprintf("UPDATE %s SET %s=?, %s=?, %s=? WHERE %s=?", cf.table, cf.etagf, cf.datef, cf.contentf, cf.urlf)
-	c.afterQuery = cf.after
+	if cf.URL == "" {
+		cf.URL = "url"
+	}
+	if cf.Etag == "" {
+		cf.Etag = "etag"
+	}
+	if cf.Date == "" {
+		cf.Date = "tstamp"
+	}
+	if cf.Content == "" {
+		cf.Content = "content"
+	}
+	c.readQuery = fmt.Sprintf("SELECT %s,%s,%s FROM %s", cf.URL, cf.Etag, cf.Date, cf.Table)
+	c.updateQuery = fmt.Sprintf("UPDATE %s SET %s=?, %s=?, %s=? WHERE %s=?", cf.Table, cf.Etag, cf.Date, cf.Content, cf.URL)
+	c.afterQueries = cf.After
 	return c, nil
 }
 
@@ -85,32 +154,46 @@ func (c *dbconn) set(e *entry) error {
 	return nil
 }
 
-func (c *dbconn) after() error {
-	// TODO
-	return nil
+func (c *dbconn) after() {
+	for i := range c.afterQueries {
+		rows, err := c.db.Query(c.afterQueries[i])
+		if err != nil {
+			log.Printf("%s: after update query failed: %s: %v", c.name, c.afterQueries[i], err)
+			continue
+		}
+		rows.Close()
+	}
 }
 
 func (c *dbconn) finalize(n int, ready <-chan *entry, done chan<- struct{}) {
+	var updated bool
 	for i := 0; i < n; i++ {
 		e := <-ready
-		// TODO: if e.err, print error and continue
 		if e.err != nil {
-			log.Printf("update: failed refreshing %s: %v", e.url, err)
+			if e.err != errUnchanged {
+				log.Printf("%s: failed refreshing URL %s: %v", c.name, e.url, e.err)
+			} else {
+				vlog.Printf("%s: unchanged %s", c.name, e.url)
+			}
 			continue
 		}
 		if err := c.set(e); err != nil {
-			log.Printf("update: %v", err)
+			log.Printf("%s: update: %s: %v", c.name, e.url, err)
+			continue
+		} else {
+			vlog.Printf("%s: updated %s", c.name, e.url)
 		}
-		fmt.Printf("DEBUG: SET %s\n", e.url)
+		updated = true
 	}
-	if err := c.after(); err != nil {
-		log.Printf("after update: %v", err)
+	// Only execute after() is something actually changed
+	if updated {
+		c.after()
 	}
 	done <- struct{}{}
 }
 
 // TODO: pass logger
-func (c *dbconn) update(es []*entry, fetchers chan<- func(), done chan<- struct{}) {
+func (c *dbconn) update(es []*entry, fetchers chan<- func(*http.Client), done chan<- struct{}) {
 	subdone := make(chan *entry) // can buffer len(es)
 	go c.finalize(len(es), subdone, done)
 	for i := range es {
@@ -118,108 +201,126 @@ func (c *dbconn) update(es []*entry, fetchers chan<- func(), done chan<- struct{
 	}
 }
 
-func fetch(e *entry, ready chan<- *entry) func() {
-	return func() {
-		fmt.Printf("DEBUG: FETCH %s\n", e.url)
+func fetch(e *entry, ready chan<- *entry) func(hc *http.Client) {
+	return func(hc *http.Client) {
+		e.refresh(hc)
 		ready <- e
 	}
 }
 
-func joinDbflags(vs dbflag, j string) string {
-	strs := make([]string, len(vs))
-	for _, s := range vs {
-		strs = append(strs, s.String())
+type duration time.Duration
+
+func (d *duration) UnmarshalJSON(data []byte) error {
+	s := strings.Trim(string(data), "\"")
+	t, err := time.ParseDuration(s)
+	if err != nil {
+		return err
 	}
-	return strings.Join(strs, j)
-}
-
-type dbconf struct {
-	dsn      string
-	table    string
-	urlf     string
-	etagf    string
-	datef    string
-	contentf string
-	after    string
-}
-
-func (c *dbconf) String() string {
-	return fmt.Sprintf("%s/%s,%s,%s,%s,%s", c.dsn, c.table, c.urlf, c.etagf, c.datef, c.contentf)
-}
-
-type dbflag []dbconf
-
-func (f *dbflag) String() string {
-	return joinDbflags(*f, " ")
-}
-
-func (f *dbflag) Set(s string) error {
-	var cf dbconf
-	p := strings.LastIndexByte(s, '/')
-	if p < 0 {
-		return fmt.Errorf("'%s' must include '/database/table,fields...'", s)
-	}
-	cf.dsn = s[0:p]
-	parts := strings.SplitN(s[p+1:], ",", 5)
-	cf.table = parts[0]
-	fls := []*string{&cf.urlf, &cf.etagf, &cf.datef, &cf.contentf}
-	defaults := []string{"url", "etag", "tstamp", "body"}
-	for i := 0; i < len(fls); i++ {
-		*fls[i] = defaults[i]
-	}
-	for i := 0; i < len(fls); i++ {
-		if len(parts) <= i+1 {
-			break
-		}
-		*fls[i] = parts[i+1]
-	}
-	*f = append(*f, cf)
+	*d = duration(t)
 	return nil
 }
 
-func (f dbflag) connect() ([]*dbconn, error) {
-	var conns []*dbconn
-	for i := range f {
-		c, err := newDbconn(&f[i])
+type JsonConf struct {
+	Sleep   duration
+	Systems map[string]*DBConf
+}
+
+type DBConf struct {
+	DSN     string
+	Table   string
+	URL     string
+	Etag    string
+	Date    string
+	Content string
+	After   []string
+}
+
+func (cf *JsonConf) connect() (map[string]*dbconn, error) {
+	conns := make(map[string]*dbconn)
+	for name, conf := range cf.Systems {
+		c, err := newDbconn(name, conf)
 		if err != nil {
-			return nil, fmt.Errorf("cannot start database connection: %v", err)
+			return nil, fmt.Errorf("%s: cannot start database connection: %v", name, err)
 		}
-		conns = append(conns, c)
+		conns[name] = c
 	}
 	return conns, nil
 }
 
-func fetcher(fns <-chan func()) {
+type fetcher struct {
+	fns    chan func(*http.Client)
+	client *http.Client
+}
+
+func newFetcher(nworkers int, c *http.Client) *fetcher {
+	f := &fetcher{
+		fns:    make(chan func(*http.Client)),
+		client: c,
+	}
+	for i := 0; i < nworkers; i++ {
+		go f.run(f.fns)
+	}
+	return f
+}
+
+func (f *fetcher) run(fns <-chan func(*http.Client)) {
 	for fn := range fns {
-		fn()
+		fn(f.client)
 	}
 }
 
+func makeHttpClient() *http.Client {
+	hc := &http.Client{}
+	return hc
+}
+
+func loadJsonConf(fname string) (*JsonConf, error) {
+	r, err := os.Open(fname)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open JSON configuration file: %v", err)
+	}
+	defer r.Close()
+	cf := &JsonConf{}
+	dec := json.NewDecoder(r)
+	if err = dec.Decode(cf); err != nil {
+		return nil, fmt.Errorf("cannot decode JSON configuration file: %v", err)
+	}
+	return cf, nil
+}
+
 func main() {
-	//wait := 5 * time.Second
-	nFetchers := 5
-	var dbflags dbflag
-	flag.Var(&dbflags, "db", "Database connection string in format user:password@tcp(localhost:3306)/database/table[,url-field,etag-field,date-field,content-field]")
+	nFetchers := flag.Int("fetchers", 5, "Number of parallel HTTP downloaders")
+	cfname := flag.String("conf", "", "JSON configuration file")
+	verbose := flag.Bool("verbose", false, "Be verbose")
 	flag.Parse()
-	conns, err := dbflags.connect()
+	vlogOut := ioutil.Discard
+	if *verbose {
+		vlogOut = os.Stderr
+	}
+	vlog = log.New(vlogOut, "INFO", log.LstdFlags)
+	if *cfname == "" {
+		log.Fatal("fatal: option -conf is mandatory")
+	}
+	cf, err := loadJsonConf(*cfname)
+	if err != nil {
+		log.Fatalf("Unrecoverable error: cannot use JSON configuration file %s: %v", *cfname, err)
+	}
+	conns, err := cf.connect()
 	if err != nil {
 		log.Fatalf("Unrecoverable error: %v", err)
 	}
 	done := make(chan struct{})
-	fetchers := make(chan func())
-	for i := 0; i < nFetchers; i++ {
-		go fetcher(fetchers)
-	}
-	//for {
-	for i := range conns {
-		ents, err := conns[i].query()
-		if err != nil {
-			log.Printf("Error: %v", err) // TODO: print DSN etc
-			continue
+	fetchers := newFetcher(*nFetchers, makeHttpClient())
+	for {
+		for name := range conns {
+			ents, err := conns[name].query()
+			if err != nil {
+				log.Printf("Error: %s: %v", name, err)
+				continue
+			}
+			go conns[name].update(ents, fetchers.fns, done)
+			<-done
 		}
-		go conns[i].update(ents, fetchers, done)
-		<-done
+		time.Sleep(time.Duration(cf.Sleep))
 	}
-	//	time.Sleep(wait)
-	//}
 }
