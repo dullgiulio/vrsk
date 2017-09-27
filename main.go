@@ -201,6 +201,10 @@ func (c *dbconn) query() ([]*entry, error) {
 	return entries, nil
 }
 
+func (c *dbconn) ping() error {
+    return c.db.Ping()
+}
+
 func (c *dbconn) set(e *entry) error {
 	rows, err := c.db.Query(c.updateQuery, e.etag, fmt.Sprintf("%d", e.date.Unix()), e.content, e.url)
 	if err != nil {
@@ -368,13 +372,17 @@ func main() {
 	done := make(chan struct{})
 	fetchers := newFetcher(*nFetchers, makeHttpClient())
 	for {
-		for name := range conns {
-			ents, err := conns[name].query()
+		for _, conn := range conns {
+            if err := conn.ping(); err != nil {
+                log.Printf("Error: ping to database for %s failed: %v", conn.name, err)
+                // Continue, as connection should now be available. If not, query will actually fail.
+            }
+			ents, err := conn.query()
 			if err != nil {
-				log.Printf("Error: %s: %v", name, err)
+				log.Printf("Error: %s: %v", conn.name, err)
 				continue
 			}
-			go conns[name].update(ents, fetchers.fns, done)
+			go conn.update(ents, fetchers.fns, done)
 			<-done
 		}
 		time.Sleep(time.Duration(cf.Sleep))
