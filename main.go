@@ -202,7 +202,7 @@ func (c *dbconn) query() ([]*entry, error) {
 }
 
 func (c *dbconn) ping() error {
-    return c.db.Ping()
+	return c.db.Ping()
 }
 
 func (c *dbconn) set(e *entry) error {
@@ -373,10 +373,10 @@ func main() {
 	fetchers := newFetcher(*nFetchers, makeHttpClient())
 	for {
 		for _, conn := range conns {
-            if err := conn.ping(); err != nil {
-                log.Printf("Error: ping to database for %s failed: %v", conn.name, err)
-                // Continue, as connection should now be available. If not, query will actually fail.
-            }
+			if err := conn.ping(); err != nil {
+				log.Printf("Error: ping to database for %s failed: %v", conn.name, err)
+				// Continue, as connection should now be available. If not, query will actually fail.
+			}
 			ents, err := conn.query()
 			if err != nil {
 				log.Printf("Error: %s: %v", conn.name, err)
