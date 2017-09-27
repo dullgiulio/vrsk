@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -21,53 +22,55 @@ import (
 // logger for verbose mode
 var vlog *log.Logger
 
-// TODO: For each run, fetch each URL only once (cache response)
+// TODO: Validate XML and JSON responses and save only if validation succeeded
 // TODO: Also save headers
 // TODO: Expires field is ignored, update it
 
-func httpEtagGet(hc *http.Client, url, etagReq string) (body []byte, etag string, err error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, "", fmt.Errorf("cannot create HTTP request: %v", err)
-	}
-	if etagReq != "" {
-		req.Header.Add("If-None-Match", etagReq)
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("cannot GET from HTTP: %s", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusNotModified {
-			err = errUnchanged
-		} else {
-			err = fmt.Errorf("server returned status: %s", resp.Status)
-		}
-		io.Copy(ioutil.Discard, resp.Body)
-		return nil, "", err
-	}
-	body, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("cannot read from HTTP: %s", err)
-	}
-	etag = strings.Trim(resp.Header.Get("Etag"), "\"")
-	return body, etag, nil
+var errUnchanged = errors.New("unchanged")
+
+type ctype int // Content-types that can be validated
+
+const (
+	ctypeAny = iota
+	ctypeXML
+	ctypeJSON
+)
+
+var ctypeContains = map[ctype]string{
+	ctypeXML:  "text/xml",
+	ctypeJSON: "application/json",
 }
 
-var errUnchanged = errors.New("unchanged")
+func detectCtype(v string) ctype {
+	for ct, str := range ctypeContains {
+		if strings.Contains(v, str) {
+			return ct
+		}
+	}
+	return ctypeAny
+}
+
+func (c ctype) String() string {
+	s, ok := ctypeContains[c]
+	if !ok {
+		return ""
+	}
+	return s
+}
 
 type entry struct {
 	url, etag string
 	content   []byte
 	date      time.Time
+	ctype     ctype
 	err       error
 }
 
-func newEntry(url, etag, date string) (*entry, error) {
+func newEntry(url, etag, date string, content []byte) (*entry, error) {
 	e := &entry{
-		url:  url,
-		etag: etag,
+		url:     url,
+		etag:    etag,
+		content: content,
 	}
 	var err error
 	n, err := strconv.ParseInt(date, 10, 64)
@@ -78,15 +81,65 @@ func newEntry(url, etag, date string) (*entry, error) {
 	return e, nil
 }
 
+// httpGet performs a GET request for entry e, optionally using Etag.
+// It returns a new entry object on success or nil and an error.
+// In case of unchanged data, errUnchanged is returned.
+func (e *entry) httpGet(hc *http.Client) (*entry, error) {
+	ne := &entry{} // resulting entry
+	req, err := http.NewRequest("GET", e.url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create HTTP request: %v", err)
+	}
+	if e.etag != "" {
+		req.Header.Add("If-None-Match", e.etag)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cannot GET from HTTP: %s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusNotModified {
+			err = errUnchanged
+		} else {
+			err = fmt.Errorf("server returned status: %s", resp.Status)
+		}
+		io.Copy(ioutil.Discard, resp.Body)
+		return nil, err
+	}
+	ne.content, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read from HTTP: %s", err)
+	}
+	ne.etag = strings.Trim(resp.Header.Get("Etag"), "\"")
+	ne.ctype = detectCtype(resp.Header.Get("Content-Type"))
+	return ne, nil
+}
+
+// equal returns true when ne has the same content and content-type as e.
+// Unspecified content-type is ignored in comparison.
+func (e *entry) equal(ne *entry) bool {
+	if e.ctype != ctypeAny && e.ctype != ne.ctype {
+		return false
+	}
+	return bytes.Equal(e.content, ne.content)
+}
+
 func (e *entry) refresh(hc *http.Client) {
-	body, etag, err := httpEtagGet(hc, e.url, e.etag)
+	ne, err := e.httpGet(hc)
 	if err != nil {
 		e.err = err
 		return
 	}
+	// For those who don't use etags, same content means unchanged
+	if e.equal(ne) {
+		e.err = errUnchanged
+		return
+	}
 	e.err = nil
-	e.content = body
-	e.etag = etag
+	e.content = ne.content
+	e.etag = ne.etag
+	e.ctype = ne.ctype
 	e.date = time.Now()
 }
 
@@ -117,7 +170,7 @@ func newDbconn(name string, cf *DBConf) (*dbconn, error) {
 	if cf.Content == "" {
 		cf.Content = "content"
 	}
-	c.readQuery = fmt.Sprintf("SELECT %s,%s,%s FROM %s", cf.URL, cf.Etag, cf.Date, cf.Table)
+	c.readQuery = fmt.Sprintf("SELECT %s,%s,%s,%s FROM %s", cf.URL, cf.Etag, cf.Date, cf.Content, cf.Table)
 	c.updateQuery = fmt.Sprintf("UPDATE %s SET %s=?, %s=?, %s=? WHERE %s=?", cf.Table, cf.Etag, cf.Date, cf.Content, cf.URL)
 	c.afterQueries = cf.After
 	return c, nil
@@ -132,11 +185,14 @@ func (c *dbconn) query() ([]*entry, error) {
 	defer rows.Close()
 	for rows.Next() {
 		// Scan date as string and convert later to have better error message
-		var url, etag, date string
-		if err := rows.Scan(&url, &etag, &date); err != nil {
+		var (
+			url, etag, date string
+			content         []byte
+		)
+		if err := rows.Scan(&url, &etag, &date, &content); err != nil {
 			return nil, fmt.Errorf("cannot read URL row: %v", err)
 		}
-		e, err := newEntry(url, etag, date)
+		e, err := newEntry(url, etag, date, content)
 		if err != nil {
 			return nil, err
 		}
@@ -297,7 +353,7 @@ func main() {
 	if *verbose {
 		vlogOut = os.Stderr
 	}
-	vlog = log.New(vlogOut, "INFO", log.LstdFlags)
+	vlog = log.New(vlogOut, "INFO - ", log.LstdFlags)
 	if *cfname == "" {
 		log.Fatal("fatal: option -conf is mandatory")
 	}
