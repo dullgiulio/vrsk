@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"flag"
 	"fmt"
@@ -36,26 +37,51 @@ const (
 	ctypeJSON
 )
 
-var ctypeContains = map[ctype]string{
-	ctypeXML:  "text/xml",
-	ctypeJSON: "application/json",
+type decoder interface {
+	suitable(mime string) bool
+	validate(data []byte) error
+}
+
+type xmlDecoder struct{}
+
+func (xmlDecoder) suitable(mime string) bool {
+	return strings.Contains(mime, "text/xml")
+}
+
+func (xmlDecoder) validate(data []byte) error {
+	var v interface{}
+	if err := xml.Unmarshal(data, &v); err != nil {
+		return fmt.Errorf("invalid XML: %v", err)
+	}
+	return nil
+}
+
+type jsonDecoder struct{}
+
+func (jsonDecoder) suitable(mime string) bool {
+	return strings.Contains(mime, "application/") && strings.Contains(mime, "json")
+}
+
+func (jsonDecoder) validate(data []byte) error {
+	var v interface{}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return fmt.Errorf("invalid JSON: %v", err)
+	}
+	return nil
+}
+
+var ctypeDecoders = map[ctype]decoder{
+	ctypeXML:  &xmlDecoder{},
+	ctypeJSON: &jsonDecoder{},
 }
 
 func detectCtype(v string) ctype {
-	for ct, str := range ctypeContains {
-		if strings.Contains(v, str) {
+	for ct, dec := range ctypeDecoders {
+		if dec.suitable(v) {
 			return ct
 		}
 	}
 	return ctypeAny
-}
-
-func (c ctype) String() string {
-	s, ok := ctypeContains[c]
-	if !ok {
-		return ""
-	}
-	return s
 }
 
 type entry struct {
@@ -125,6 +151,15 @@ func (e *entry) equal(ne *entry) bool {
 	return bytes.Equal(e.content, ne.content)
 }
 
+func (e *entry) valid() error {
+	dec, ok := ctypeDecoders[e.ctype]
+	if !ok {
+		// No suitable decoder means valid
+		return nil
+	}
+	return dec.validate(e.content)
+}
+
 func (e *entry) refresh(hc *http.Client) {
 	ne, err := e.httpGet(hc)
 	if err != nil {
@@ -134,6 +169,10 @@ func (e *entry) refresh(hc *http.Client) {
 	// For those who don't use etags, same content means unchanged
 	if e.equal(ne) {
 		e.err = errUnchanged
+		return
+	}
+	if err := e.valid(); err != nil {
+		e.err = fmt.Errorf("invalid element not refreshed: %v", err)
 		return
 	}
 	e.err = nil
