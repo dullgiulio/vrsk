@@ -17,13 +17,18 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
-// logger for verbose mode
-var vlog *log.Logger
+var (
+	// logger for verbose mode
+	vlog *log.Logger
+	// logger for errors
+	elog *log.Logger
+	// logger for debug mode
+	dbglog *log.Logger
+)
 
-// TODO: Validate XML and JSON responses and save only if validation succeeded
 // TODO: Also save headers
 // TODO: Expires field is ignored, update it
 
@@ -257,7 +262,7 @@ func (c *dbconn) after() {
 	for i := range c.afterQueries {
 		rows, err := c.db.Query(c.afterQueries[i])
 		if err != nil {
-			log.Printf("%s: after update query failed: %s: %v", c.name, c.afterQueries[i], err)
+			elog.Printf("%s: after update query failed: %s: %v", c.name, c.afterQueries[i], err)
 			continue
 		}
 		rows.Close()
@@ -270,14 +275,12 @@ func (c *dbconn) finalize(n int, ready <-chan *entry, done chan<- struct{}) {
 		e := <-ready
 		if e.err != nil {
 			if e.err != errUnchanged {
-				log.Printf("%s: failed refreshing URL %s: %v", c.name, e.url, e.err)
-			} else {
-				vlog.Printf("%s: unchanged %s", c.name, e.url)
+				elog.Printf("%s: failed refreshing URL %s: %v", c.name, e.url, e.err)
 			}
 			continue
 		}
 		if err := c.set(e); err != nil {
-			log.Printf("%s: update: %s: %v", c.name, e.url, err)
+			elog.Printf("%s: update: %s: %v", c.name, e.url, err)
 			continue
 		} else {
 			vlog.Printf("%s: updated %s", c.name, e.url)
@@ -391,34 +394,41 @@ func main() {
 	nFetchers := flag.Int("fetchers", 5, "Number of parallel HTTP downloaders")
 	cfname := flag.String("conf", "", "JSON configuration file")
 	verbose := flag.Bool("verbose", false, "Be verbose")
+	debug := flag.Bool("debug", false, "Show debugging messages")
 	flag.Parse()
 	vlogOut := ioutil.Discard
+	dbglogOut := ioutil.Discard
 	if *verbose {
-		vlogOut = os.Stderr
+		vlogOut = os.Stdout
 	}
+	if *debug {
+		vlogOut = os.Stdout
+		dbglogOut = os.Stdout
+	}
+	elog = log.New(os.Stderr, "ERROR - ", log.LstdFlags)
 	vlog = log.New(vlogOut, "INFO - ", log.LstdFlags)
+	dbglog = log.New(dbglogOut, "DEBUG - ", log.LstdFlags)
 	if *cfname == "" {
-		log.Fatal("fatal: option -conf is mandatory")
+		elog.Fatal("fatal: option -conf is mandatory")
 	}
 	cf, err := loadJsonConf(*cfname)
 	if err != nil {
-		log.Fatalf("Unrecoverable error: cannot use JSON configuration file %s: %v", *cfname, err)
+		elog.Fatalf("Unrecoverable error: cannot use JSON configuration file %s: %v", *cfname, err)
 	}
+	mysql.SetLogger(dbglog)
 	conns, err := cf.connect()
 	if err != nil {
-		log.Fatalf("Unrecoverable error: %v", err)
+		elog.Fatalf("Unrecoverable error: %v", err)
 	}
 	done := make(chan struct{})
 	fetchers := newFetcher(*nFetchers, makeHttpClient())
 	for {
 		for _, conn := range conns {
-			if err := conn.ping(); err != nil {
-				log.Printf("Error: ping to database for %s failed: %v", conn.name, err)
-				// Continue, as connection should now be available. If not, query will actually fail.
-			}
+			// Ignore errors when pinging, as it might hit a closed connection
+			conn.ping()
 			ents, err := conn.query()
 			if err != nil {
-				log.Printf("Error: %s: %v", conn.name, err)
+				elog.Printf("%s: %v", conn.name, err)
 				continue
 			}
 			go conn.update(ents, fetchers.fns, done)
