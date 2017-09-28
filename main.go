@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -269,13 +270,15 @@ func (c *dbconn) after() {
 	}
 }
 
-func (c *dbconn) finalize(n int, ready <-chan *entry, done chan<- struct{}) {
+func (c *dbconn) finalize(n int, ready <-chan *entry, wg *sync.WaitGroup) {
 	var updated bool
 	for i := 0; i < n; i++ {
 		e := <-ready
 		if e.err != nil {
 			if e.err != errUnchanged {
 				elog.Printf("%s: failed refreshing URL %s: %v", c.name, e.url, e.err)
+			} else {
+				dbglog.Printf("%s: %s unchanged", c.name, e.url)
 			}
 			continue
 		}
@@ -291,13 +294,12 @@ func (c *dbconn) finalize(n int, ready <-chan *entry, done chan<- struct{}) {
 	if updated {
 		c.after()
 	}
-	done <- struct{}{}
+	wg.Done()
 }
 
-// TODO: pass logger
-func (c *dbconn) update(es []*entry, fetchers chan<- func(*http.Client), done chan<- struct{}) {
+func (c *dbconn) update(es []*entry, fetchers chan<- func(*http.Client), wg *sync.WaitGroup) {
 	subdone := make(chan *entry) // can buffer len(es)
-	go c.finalize(len(es), subdone, done)
+	go c.finalize(len(es), subdone, wg)
 	for i := range es {
 		fetchers <- fetch(es[i], subdone)
 	}
@@ -390,6 +392,25 @@ func loadJsonConf(fname string) (*JsonConf, error) {
 	return cf, nil
 }
 
+func fetchEvery(d time.Duration, f *fetcher, conns map[string]*dbconn) {
+	var wg sync.WaitGroup
+	for {
+		for _, conn := range conns {
+			// Ignore errors when pinging, as it might hit a closed connection
+			conn.ping()
+			ents, err := conn.query()
+			if err != nil {
+				elog.Printf("%s: %v", conn.name, err)
+				continue
+			}
+			wg.Add(1)
+			go conn.update(ents, f.fns, &wg)
+		}
+		wg.Wait()
+		time.Sleep(d)
+	}
+}
+
 func main() {
 	nFetchers := flag.Int("fetchers", 5, "Number of parallel HTTP downloaders")
 	cfname := flag.String("conf", "", "JSON configuration file")
@@ -420,20 +441,5 @@ func main() {
 	if err != nil {
 		elog.Fatalf("Unrecoverable error: %v", err)
 	}
-	done := make(chan struct{})
-	fetchers := newFetcher(*nFetchers, makeHttpClient())
-	for {
-		for _, conn := range conns {
-			// Ignore errors when pinging, as it might hit a closed connection
-			conn.ping()
-			ents, err := conn.query()
-			if err != nil {
-				elog.Printf("%s: %v", conn.name, err)
-				continue
-			}
-			go conn.update(ents, fetchers.fns, done)
-			<-done
-		}
-		time.Sleep(time.Duration(cf.Sleep))
-	}
+	fetchEvery(time.Duration(cf.Sleep), newFetcher(*nFetchers, makeHttpClient()), conns)
 }
