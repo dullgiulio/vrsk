@@ -194,11 +194,15 @@ type dbconn struct {
 	readQuery    string
 	updateQuery  string
 	afterQueries []string
+	entries      chan *entry
 }
 
 func newDbconn(name string, cf *DBConf) (*dbconn, error) {
 	var err error
-	c := &dbconn{name: name}
+	c := &dbconn{
+		name:    name,
+		entries: make(chan *entry), // can buffer this channel
+	}
 	c.db, err = sql.Open("mysql", cf.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open SQL database: %v", err)
@@ -270,10 +274,12 @@ func (c *dbconn) after() {
 	}
 }
 
-func (c *dbconn) finalize(n int, ready <-chan *entry, wg *sync.WaitGroup) {
+// finalize reads n entries from the entries channel and processes them, either saving or
+// displaying errors or information. Only when something is saved, dbconn.after() is called.
+func (c *dbconn) finalize(n int) {
 	var updated bool
 	for i := 0; i < n; i++ {
-		e := <-ready
+		e := <-c.entries
 		if e.err != nil {
 			if e.err != errUnchanged {
 				elog.Printf("%s: failed refreshing URL %s: %v", c.name, e.url, e.err)
@@ -285,30 +291,36 @@ func (c *dbconn) finalize(n int, ready <-chan *entry, wg *sync.WaitGroup) {
 		if err := c.set(e); err != nil {
 			elog.Printf("%s: update: %s: %v", c.name, e.url, err)
 			continue
-		} else {
-			vlog.Printf("%s: updated %s", c.name, e.url)
 		}
+		vlog.Printf("%s: updated %s", c.name, e.url)
 		updated = true
 	}
 	// Only execute after() is something actually changed
 	if updated {
 		c.after()
 	}
-	wg.Done()
 }
 
-func (c *dbconn) update(es []*entry, fetchers chan<- func(*http.Client), wg *sync.WaitGroup) {
-	subdone := make(chan *entry) // can buffer len(es)
-	go c.finalize(len(es), subdone, wg)
-	for i := range es {
-		fetchers <- fetch(es[i], subdone)
+func (c *dbconn) update(fetcher *fetcher) {
+	// Ignore errors when pinging, as it might hit a closed connection
+	c.ping()
+	ents, err := c.query()
+	if err != nil {
+		elog.Printf("%s: %v", c.name, err)
+		return
 	}
+	go func() {
+		for i := range ents {
+			fetcher.fetch(ents[i], c.entries)
+		}
+	}()
+	c.finalize(len(ents))
 }
 
-func fetch(e *entry, ready chan<- *entry) func(hc *http.Client) {
-	return func(hc *http.Client) {
-		e.refresh(hc)
-		ready <- e
+func (c *dbconn) run(ftc *fetcher, ticker <-chan *sync.WaitGroup) {
+	for wg := range ticker {
+		c.update(ftc)
+		wg.Done()
 	}
 }
 
@@ -339,16 +351,38 @@ type DBConf struct {
 	After   []string
 }
 
-func (cf *JsonConf) connect() (map[string]*dbconn, error) {
-	conns := make(map[string]*dbconn)
+type runner struct {
+	conns   []*dbconn
+	fetcher *fetcher
+}
+
+func newRunner(cf *JsonConf, fts *fetcher) (*runner, error) {
+	var conns []*dbconn
 	for name, conf := range cf.Systems {
 		c, err := newDbconn(name, conf)
 		if err != nil {
 			return nil, fmt.Errorf("%s: cannot start database connection: %v", name, err)
 		}
-		conns[name] = c
+		conns = append(conns, c)
 	}
-	return conns, nil
+	return &runner{conns: conns, fetcher: fts}, nil
+}
+
+func (r *runner) wake(c *dbconn, wg *sync.WaitGroup) {
+	c.update(r.fetcher)
+	wg.Done()
+}
+
+func (r *runner) every(d time.Duration) {
+	wg := &sync.WaitGroup{}
+	for {
+		wg.Add(len(r.conns))
+		for i := range r.conns {
+			go r.wake(r.conns[i], wg)
+		}
+		wg.Wait()
+		time.Sleep(d)
+	}
 }
 
 type fetcher struct {
@@ -373,6 +407,13 @@ func (f *fetcher) run(fns <-chan func(*http.Client)) {
 	}
 }
 
+func (f *fetcher) fetch(e *entry, ready chan<- *entry) {
+	f.fns <- func(hc *http.Client) {
+		e.refresh(hc)
+		ready <- e
+	}
+}
+
 func makeHttpClient() *http.Client {
 	hc := &http.Client{}
 	return hc
@@ -392,25 +433,6 @@ func loadJsonConf(fname string) (*JsonConf, error) {
 	return cf, nil
 }
 
-func fetchEvery(d time.Duration, f *fetcher, conns map[string]*dbconn) {
-	var wg sync.WaitGroup
-	for {
-		for _, conn := range conns {
-			// Ignore errors when pinging, as it might hit a closed connection
-			conn.ping()
-			ents, err := conn.query()
-			if err != nil {
-				elog.Printf("%s: %v", conn.name, err)
-				continue
-			}
-			wg.Add(1)
-			go conn.update(ents, f.fns, &wg)
-		}
-		wg.Wait()
-		time.Sleep(d)
-	}
-}
-
 func main() {
 	nFetchers := flag.Int("fetchers", 5, "Number of parallel HTTP downloaders")
 	cfname := flag.String("conf", "", "JSON configuration file")
@@ -426,6 +448,7 @@ func main() {
 		vlogOut = os.Stdout
 		dbglogOut = os.Stdout
 	}
+	log.SetOutput(dbglogOut)
 	elog = log.New(os.Stderr, "ERROR - ", log.LstdFlags)
 	vlog = log.New(vlogOut, "INFO - ", log.LstdFlags)
 	dbglog = log.New(dbglogOut, "DEBUG - ", log.LstdFlags)
@@ -437,9 +460,9 @@ func main() {
 		elog.Fatalf("Unrecoverable error: cannot use JSON configuration file %s: %v", *cfname, err)
 	}
 	mysql.SetLogger(dbglog)
-	conns, err := cf.connect()
+	run, err := newRunner(cf, newFetcher(*nFetchers, makeHttpClient()))
 	if err != nil {
 		elog.Fatalf("Unrecoverable error: %v", err)
 	}
-	fetchEvery(time.Duration(cf.Sleep), newFetcher(*nFetchers, makeHttpClient()), conns)
+	run.every(time.Duration(cf.Sleep))
 }
