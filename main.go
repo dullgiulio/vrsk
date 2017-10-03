@@ -12,6 +12,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"strconv"
 	"strings"
@@ -93,6 +94,7 @@ func detectCtype(v string) ctype {
 type entry struct {
 	url, etag string
 	content   []byte
+	headers   []byte
 	date      time.Time
 	ctype     ctype
 	err       error
@@ -143,6 +145,10 @@ func (e *entry) httpGet(hc *http.Client) (*entry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot read from HTTP: %s", err)
 	}
+	ne.headers, err = httputil.DumpResponse(resp, false)
+	if err != nil {
+		return nil, fmt.Errorf("cannot dump HTTP response: %s", err)
+	}
 	ne.etag = strings.Trim(resp.Header.Get("Etag"), "\"")
 	ne.ctype = detectCtype(resp.Header.Get("Content-Type"))
 	return ne, nil
@@ -183,6 +189,7 @@ func (e *entry) refresh(hc *http.Client) {
 	}
 	e.err = nil
 	e.content = ne.content
+	e.headers = ne.headers
 	e.etag = ne.etag
 	e.ctype = ne.ctype
 	e.date = time.Now()
@@ -219,8 +226,11 @@ func newDbconn(name string, cf *DBConf) (*dbconn, error) {
 	if cf.Content == "" {
 		cf.Content = "content"
 	}
+	if cf.Headers == "" {
+		cf.Headers = "headers"
+	}
 	c.readQuery = fmt.Sprintf("SELECT %s,%s,%s,%s FROM %s", cf.URL, cf.Etag, cf.Date, cf.Content, cf.Table)
-	c.updateQuery = fmt.Sprintf("UPDATE %s SET %s=?, %s=?, %s=? WHERE %s=?", cf.Table, cf.Etag, cf.Date, cf.Content, cf.URL)
+	c.updateQuery = fmt.Sprintf("UPDATE %s SET %s=?, %s=?, %s=?, %s=? WHERE %s=?", cf.Table, cf.Etag, cf.Date, cf.Content, cf.Headers, cf.URL)
 	c.afterQueries = cf.After
 	return c, nil
 }
@@ -255,7 +265,7 @@ func (c *dbconn) ping() error {
 }
 
 func (c *dbconn) set(e *entry) error {
-	rows, err := c.db.Query(c.updateQuery, e.etag, fmt.Sprintf("%d", e.date.Unix()), e.content, e.url)
+	rows, err := c.db.Query(c.updateQuery, e.etag, fmt.Sprintf("%d", e.date.Unix()), e.content, e.headers, e.url)
 	if err != nil {
 		return fmt.Errorf("cannot update '%s' in DB: %v", e.url, err)
 	}
@@ -347,6 +357,7 @@ type DBConf struct {
 	URL     string
 	Etag    string
 	Date    string
+	Headers string
 	Content string
 	After   []string
 }
