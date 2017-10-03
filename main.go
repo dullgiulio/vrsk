@@ -127,6 +127,7 @@ func (e *entry) httpGet(hc *http.Client) (*entry, error) {
 	if e.etag != "" {
 		req.Header.Add("If-None-Match", e.etag)
 	}
+	req.Header.Set("User-Agent", "vrsk/0.1")
 	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cannot GET from HTTP: %s", err)
