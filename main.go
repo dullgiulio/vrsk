@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -385,15 +387,14 @@ func (r *runner) wake(c *dbconn, wg *sync.WaitGroup) {
 	wg.Done()
 }
 
-func (r *runner) every(d time.Duration) {
+func (r *runner) run(c <-chan struct{}) {
 	wg := &sync.WaitGroup{}
-	for {
+	for range c {
 		wg.Add(len(r.conns))
 		for i := range r.conns {
 			go r.wake(r.conns[i], wg)
 		}
 		wg.Wait()
-		time.Sleep(d)
 	}
 }
 
@@ -445,6 +446,12 @@ func loadJsonConf(fname string) (*JsonConf, error) {
 	return cf, nil
 }
 
+func signaltrap() <-chan os.Signal {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGHUP)
+	return c
+}
+
 func main() {
 	nFetchers := flag.Int("fetchers", 5, "Number of parallel HTTP downloaders")
 	cfname := flag.String("conf", "", "JSON configuration file")
@@ -476,5 +483,19 @@ func main() {
 	if err != nil {
 		elog.Fatalf("Unrecoverable error: %v", err)
 	}
-	run.every(time.Duration(cf.Sleep))
+	ticks := make(chan struct{})
+	go func() {
+		sin := signaltrap()
+		tin := time.Tick(time.Duration(cf.Sleep))
+		ticks <- struct{}{}
+		for {
+			select {
+			case <-sin:
+				ticks <- struct{}{}
+			case <-tin:
+				ticks <- struct{}{}
+			}
+		}
+	}()
+	run.run(ticks)
 }
