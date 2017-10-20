@@ -33,18 +33,9 @@ var (
 	dbglog *log.Logger
 )
 
-// TODO: Also save headers
 // TODO: Expires field is ignored, update it
 
 var errUnchanged = errors.New("unchanged")
-
-type ctype int // Content-types that can be validated
-
-const (
-	ctypeAny = iota
-	ctypeXML
-	ctypeJSON
-)
 
 type decoder interface {
 	suitable(mime string) bool
@@ -79,26 +70,30 @@ func (jsonDecoder) validate(data []byte) error {
 	return nil
 }
 
-var ctypeDecoders = map[ctype]decoder{
-	ctypeXML:  &xmlDecoder{},
-	ctypeJSON: &jsonDecoder{},
+// slice of all implemented decoders
+var decoders = []decoder{
+	&xmlDecoder{},
+	&jsonDecoder{},
 }
 
-func detectCtype(v string) ctype {
-	for ct, dec := range ctypeDecoders {
-		if dec.suitable(v) {
-			return ct
+// detectDecoder returns a suitable decoder to handle data described by content-type ctype.
+// detectDecoder returns nil if no suitable decoder is found.
+func detectDecoder(ctype string) decoder {
+	for _, dec := range decoders {
+		if dec.suitable(ctype) {
+			return dec
 		}
 	}
-	return ctypeAny
+	return nil
 }
 
+// entry repesents a fetched source result and it's error if any processing on the entry failed.
 type entry struct {
 	url, etag string
 	content   []byte
 	headers   []byte
 	date      time.Time
-	ctype     ctype
+	decoder   decoder
 	err       error
 }
 
@@ -153,28 +148,31 @@ func (e *entry) httpGet(hc *http.Client) (*entry, error) {
 		return nil, fmt.Errorf("cannot dump HTTP response: %s", err)
 	}
 	ne.etag = strings.Trim(resp.Header.Get("Etag"), "\"")
-	ne.ctype = detectCtype(resp.Header.Get("Content-Type"))
+	ne.decoder = detectDecoder(resp.Header.Get("Content-Type"))
 	return ne, nil
 }
 
 // equal returns true when ne has the same content and content-type as e.
-// Unspecified content-type is ignored in comparison.
+// Content-type that is not checked by a decoder is ignored in the comparison.
 func (e *entry) equal(ne *entry) bool {
-	if e.ctype != ctypeAny && e.ctype != ne.ctype {
+	if e.decoder != nil && e.decoder != ne.decoder {
 		return false
 	}
 	return bytes.Equal(e.content, ne.content)
 }
 
+// valid returns an error if data is not valid for the decoder selected by the entry content-type.
+// Typically, that means XML responses must be valid XML, JSON responses valid JSON, and so on.
+// Data of a content-type that has no available decoder is considered valid.
 func (e *entry) valid() error {
-	dec, ok := ctypeDecoders[e.ctype]
-	if !ok {
-		// No suitable decoder means valid
+	// No suitable decoder means valid
+	if e.decoder == nil {
 		return nil
 	}
-	return dec.validate(e.content)
+	return e.decoder.validate(e.content)
 }
 
+// refresh fetches an entry's URL using hc as Client. Errors are saved inside the entry itself.
 func (e *entry) refresh(hc *http.Client) {
 	ne, err := e.httpGet(hc)
 	if err != nil {
@@ -194,10 +192,11 @@ func (e *entry) refresh(hc *http.Client) {
 	e.content = ne.content
 	e.headers = ne.headers
 	e.etag = ne.etag
-	e.ctype = ne.ctype
+	e.decoder = ne.decoder
 	e.date = time.Now()
 }
 
+// dbconn represents the connection to one DB source, regardless of the underlying DB connection.
 type dbconn struct {
 	db           *sql.DB
 	name         string
@@ -207,6 +206,7 @@ type dbconn struct {
 	entries      chan *entry
 }
 
+// creates a DB connection from configuration cf applying default configuration values.
 func newDbconn(name string, cf *DBConf) (*dbconn, error) {
 	var err error
 	c := &dbconn{
@@ -238,6 +238,7 @@ func newDbconn(name string, cf *DBConf) (*dbconn, error) {
 	return c, nil
 }
 
+// query fetches all source rows from the database and returns them as entries.
 func (c *dbconn) query() ([]*entry, error) {
 	var entries []*entry
 	rows, err := c.db.Query(c.readQuery)
@@ -263,10 +264,12 @@ func (c *dbconn) query() ([]*entry, error) {
 	return entries, nil
 }
 
+// ping is a convenience wrapper to ping the database and keep the connection open.
 func (c *dbconn) ping() error {
 	return c.db.Ping()
 }
 
+// set persists a source entry to the database.
 func (c *dbconn) set(e *entry) error {
 	rows, err := c.db.Query(c.updateQuery, e.etag, fmt.Sprintf("%d", e.date.Unix()), e.content, e.headers, e.url)
 	if err != nil {
@@ -276,6 +279,7 @@ func (c *dbconn) set(e *entry) error {
 	return nil
 }
 
+// after runs all the queries configured to run after successful source update.
 func (c *dbconn) after() {
 	for i := range c.afterQueries {
 		rows, err := c.db.Query(c.afterQueries[i])
@@ -314,6 +318,7 @@ func (c *dbconn) finalize(n int) {
 	}
 }
 
+// update fetches all sources from the DB with fetcher and saves the results.
 func (c *dbconn) update(fetcher *fetcher) {
 	// Ignore errors when pinging, as it might hit a closed connection
 	c.ping()
@@ -330,6 +335,8 @@ func (c *dbconn) update(fetcher *fetcher) {
 	c.finalize(len(ents))
 }
 
+// run waits for a new tick to wake up and updates all sources from it's connection.
+// run marks the received WaitGroup when done.
 func (c *dbconn) run(ftc *fetcher, ticker <-chan *sync.WaitGroup) {
 	for wg := range ticker {
 		c.update(ftc)
@@ -365,6 +372,7 @@ type DBConf struct {
 	After   []string
 }
 
+// runner represents the agent that wakes every tick and refreshes all connections using a fetcher.
 type runner struct {
 	conns   []*dbconn
 	fetcher *fetcher
