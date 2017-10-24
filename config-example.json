@@ -1,0 +1,18 @@
+{
+	"Sleep": "1m",
+	"Systems": {
+		"system.prod": {
+			"DSN": "USER:PASSWORD@tcp(localhost:3306)/DATABASE",	
+			"Table": "json_cache_table",
+			"Content": "body_content_field_in_table",
+			"URL": "url_field",
+			"Etag": "etag_field",
+			"Date": "date_timestamp_field",
+			"Headers": "headers_field",
+			"After": [
+				"TRUNCATE redered_cache_table",
+				"TRUNCATE cf_cache_json_api_tags"
+			]
+		}
+	}
+}
