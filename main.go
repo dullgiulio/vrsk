@@ -93,11 +93,12 @@ type entry struct {
 	content   []byte
 	headers   []byte
 	date      time.Time
+	expires   time.Time
 	decoder   decoder
 	err       error
 }
 
-func newEntry(url, etag, date string, content []byte) (*entry, error) {
+func newEntry(url, etag, date, expires string, content []byte) (*entry, error) {
 	e := &entry{
 		url:     url,
 		etag:    etag,
@@ -109,6 +110,11 @@ func newEntry(url, etag, date string, content []byte) (*entry, error) {
 		return nil, fmt.Errorf("date from database is not a UNIX timestamp: %v", err)
 	}
 	e.date = time.Unix(n, 0)
+	n, err = strconv.ParseInt(date, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("expires from database is not a UNIX timestamp: %v", err)
+	}
+	e.expires = time.Unix(n, 0)
 	return e, nil
 }
 
@@ -188,22 +194,28 @@ func (e *entry) refresh(hc *http.Client) {
 		e.err = fmt.Errorf("invalid element not refreshed: %v", err)
 		return
 	}
+	lasted := e.expires.Sub(e.date)
 	e.err = nil
 	e.content = ne.content
 	e.headers = ne.headers
 	e.etag = ne.etag
 	e.decoder = ne.decoder
 	e.date = time.Now()
+	e.expires = e.date
+	if lasted >= 0 {
+		e.expires = e.expires.Add(lasted)
+	}
 }
 
 // dbconn represents the connection to one DB source, regardless of the underlying DB connection.
 type dbconn struct {
-	db           *sql.DB
-	name         string
-	readQuery    string
-	updateQuery  string
-	afterQueries []string
-	entries      chan *entry
+	db              *sql.DB
+	name            string
+	readQuery       string
+	updateQuery     string
+	updateTimeQuery string
+	afterQueries    []string
+	entries         chan *entry
 }
 
 // creates a DB connection from configuration cf applying default configuration values.
@@ -232,8 +244,12 @@ func newDbconn(name string, cf *DBConf) (*dbconn, error) {
 	if cf.Headers == "" {
 		cf.Headers = "headers"
 	}
-	c.readQuery = fmt.Sprintf("SELECT %s,%s,%s,%s FROM %s", cf.URL, cf.Etag, cf.Date, cf.Content, cf.Table)
-	c.updateQuery = fmt.Sprintf("UPDATE %s SET %s=?, %s=?, %s=?, %s=? WHERE %s=?", cf.Table, cf.Etag, cf.Date, cf.Content, cf.Headers, cf.URL)
+	if cf.Expires == "" {
+		cf.Expires = "expires"
+	}
+	c.readQuery = fmt.Sprintf("SELECT %s,%s,%s,%s,%s FROM %s WHERE %s <= UNIX_TIMESTAMP(NOW())", cf.URL, cf.Etag, cf.Date, cf.Expires, cf.Content, cf.Table, cf.Expires)
+	c.updateQuery = fmt.Sprintf("UPDATE %s SET %s=?, %s=?, %s=?, %s=?, %s=? WHERE %s=?", cf.Table, cf.Etag, cf.Date, cf.Expires, cf.Content, cf.Headers, cf.URL)
+	c.updateTimeQuery = fmt.Sprintf("UPDATE %s SET %s=?, %s=? WHERE %s=?", cf.Table, cf.Date, cf.Expires, cf.URL)
 	c.afterQueries = cf.After
 	return c, nil
 }
@@ -249,13 +265,14 @@ func (c *dbconn) query() ([]*entry, error) {
 	for rows.Next() {
 		// Scan date as string and convert later to have better error message
 		var (
-			url, etag, date string
-			content         []byte
+			url, etag     string
+			date, expires string
+			content       []byte
 		)
-		if err := rows.Scan(&url, &etag, &date, &content); err != nil {
+		if err := rows.Scan(&url, &etag, &date, &expires, &content); err != nil {
 			return nil, fmt.Errorf("cannot read URL row: %v", err)
 		}
-		e, err := newEntry(url, etag, date, content)
+		e, err := newEntry(url, etag, date, expires, content)
 		if err != nil {
 			return nil, err
 		}
@@ -271,9 +288,19 @@ func (c *dbconn) ping() error {
 
 // set persists a source entry to the database.
 func (c *dbconn) set(e *entry) error {
-	rows, err := c.db.Query(c.updateQuery, e.etag, fmt.Sprintf("%d", e.date.Unix()), e.content, e.headers, e.url)
+	rows, err := c.db.Query(c.updateQuery, e.etag, fmt.Sprintf("%d", e.date.Unix()), fmt.Sprintf("%d", e.expires.Unix()), e.content, e.headers, e.url)
 	if err != nil {
 		return fmt.Errorf("cannot update '%s' in DB: %v", e.url, err)
+	}
+	rows.Close()
+	return nil
+}
+
+// set persists a source entry to the database.
+func (c *dbconn) setMeta(e *entry) error {
+	rows, err := c.db.Query(c.updateTimeQuery, fmt.Sprintf("%d", e.date.Unix()), fmt.Sprintf("%d", e.expires.Unix()), e.url)
+	if err != nil {
+		return fmt.Errorf("cannot update metadata '%s' in DB: %v", e.url, err)
 	}
 	rows.Close()
 	return nil
@@ -302,6 +329,9 @@ func (c *dbconn) finalize(n int) {
 				elog.Printf("%s: failed refreshing URL %s: %v", c.name, e.url, e.err)
 			} else {
 				dbglog.Printf("%s: %s unchanged", c.name, e.url)
+				if err := c.setMeta(e); err != nil {
+					elog.Printf("%s: failed refreshing unchanged URL: %v", c.name, e.err)
+				}
 			}
 			continue
 		}
@@ -367,6 +397,7 @@ type DBConf struct {
 	URL     string
 	Etag    string
 	Date    string
+	Expires string
 	Headers string
 	Content string
 	After   []string
